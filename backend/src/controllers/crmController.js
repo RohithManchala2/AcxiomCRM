@@ -1,17 +1,257 @@
-import mongoose from 'mongoose';import Customer from '../models/Customer.js';import Lead from '../models/Lead.js';import Opportunity from '../models/Opportunity.js';import FollowUp from '../models/FollowUp.js';import Activity from '../models/Activity.js';import User from '../models/User.js';import {audit} from '../services/auditService.js';import {emailRe,phoneRe,todayStart,cleanEmail} from '../utils/validation.js';
+import mongoose from 'mongoose';
+import Customer from '../models/Customer.js';
+import Lead from '../models/Lead.js';
+import Opportunity from '../models/Opportunity.js';
+import FollowUp from '../models/FollowUp.js';
+import Activity from '../models/Activity.js';
+import User from '../models/User.js';
+import {audit} from '../services/auditService.js';
+import {assignedScope} from '../utils/scope.js';
+import {emailRe,phoneRe,todayStart,cleanEmail} from '../utils/validation.js';
+
 const models={customers:Customer,leads:Lead,opportunities:Opportunity,followups:FollowUp,activities:Activity};
 const ownerField={customers:'owner',leads:'assignedTo',opportunities:'assignedTo',followups:'assignedTo',activities:'assignedTo'};
 const populate={customers:'owner createdBy',leads:'assignedTo convertedCustomer convertedOpportunity',opportunities:'customer lead assignedTo',followups:'customer lead opportunity assignedTo',activities:'customer lead opportunity assignedTo'};
 const auditNames={customers:'Customer',leads:'Lead',opportunities:'Opportunity',followups:'FollowUp',activities:'Activity'};
-function scope(user,key){if(user.role==='ADMIN'||user.role==='MANAGER')return {};return {[ownerField[key]]:user._id}}
-function baseQuery(user,key,query={}){return {...query,...scope(user,key)}}
-function pageParams(req){return {page:Math.max(1,Number(req.query.page)||1),limit:Math.min(100,Math.max(1,Number(req.query.limit)||10))}}
-function buildFilter(key,q){const f={};if(q.search){const r={$regex:q.search,$options:'i'};if(key==='customers')f.$or=[{customerName:r},{email:r},{phone:r},{companyName:r}];if(key==='leads')f.$or=[{leadName:r},{companyName:r},{status:r}];if(key==='opportunities')f.$or=[{opportunityName:r},{stage:r},{status:r}];if(key==='followups')f.$or=[{subject:r},{status:r},{followUpType:r}];if(key==='activities')f.$or=[{subject:r},{status:r},{activityType:r}]};for(const x of ['status','stage','priority','assignedTo','owner','followUpType','activityType'])if(q[x])f[x]=q[x];if(q.from||q.to){const field=key==='followups'?'followUpDate':key==='activities'?'activityDate':'createdAt';f[field]={};if(q.from)f[field].$gte=new Date(q.from);if(q.to){const d=new Date(q.to);d.setHours(23,59,59,999);f[field].$lte=d}}return f}
-export async function list(req,res){const key=req.params.resource;const M=models[key];if(!M)return res.status(404).json({success:false,message:'Resource not found'});const {page,limit}=pageParams(req);const filter=baseQuery(req.user,key,buildFilter(key,req.query));const total=await M.countDocuments(filter);let q=M.find(filter).sort(req.query.sort||'-createdAt').skip((page-1)*limit).limit(limit);if(populate[key])q=q.populate(populate[key]);const data=await q.lean();res.json({success:true,data,pagination:{page,limit,total,totalPages:Math.ceil(total/limit)}})}
-export async function getOne(req,res){const key=req.params.resource,M=models[key];if(!M)return res.status(404).json({success:false,message:'Resource not found'});const doc=await M.findOne(baseQuery(req.user,key,{_id:req.params.id})).populate(populate[key]||'');if(!doc)return res.status(404).json({success:false,message:'Record not found'});res.json({success:true,data:doc})}
-function validate(key,b,creating=true){const e={};if(key==='customers'){if(!b.customerName?.trim())e.customerName='Customer Name is required';if(!b.email||!emailRe.test(cleanEmail(b.email)))e.email='Enter a valid email address';if(!b.phone||!phoneRe.test(String(b.phone).replace(/\s/g,'')))e.phone='Enter a valid 10-digit Indian phone number'}if(key==='leads'){if(!b.leadName?.trim())e.leadName='Lead name is required';if(b.email&&!emailRe.test(cleanEmail(b.email)))e.email='Enter a valid email address';if(b.phone&&!phoneRe.test(String(b.phone).replace(/\s/g,'')))e.phone='Enter a valid phone number';if(b.expectedValue!=null&&Number(b.expectedValue)<0)e.expectedValue='Expected value cannot be negative'}if(key==='opportunities'){if(!b.opportunityName?.trim())e.opportunityName='Opportunity name is required';if(Number(b.amount)<=0&&b.status!=='Lost'&&b.stage!=='Lost')e.amount='Opportunity Amount must be greater than 0';if(Number(b.probability)<0||Number(b.probability)>100)e.probability='Probability must be between 0 and 100';if(b.expectedCloseDate&&new Date(b.expectedCloseDate)<todayStart()&&b.status!=='Lost'&&b.stage!=='Lost')e.expectedCloseDate='Expected Close Date cannot be in the past'}if(key==='followups'){if(!b.followUpDate)e.followUpDate='Follow-up date is required';if(b.followUpDate&&new Date(b.followUpDate)<todayStart()&&(!b.status||b.status==='Planned'))e.followUpDate='Follow-up date cannot be earlier than today'}if(key==='activities'){if(!b.activityType)e.activityType='Activity type is required';if(!b.subject?.trim())e.subject='Subject is required';if(!b.activityDate)e.activityDate='Activity date is required'}return e}
-function ownerFor(key,user,b){return ['customers'].includes(key)?(user.role==='SALES_EXECUTIVE'?user._id:(b.owner||user._id)):(user.role==='SALES_EXECUTIVE'?user._id:(b.assignedTo||user._id))}
-export async function create(req,res){const key=req.params.resource,M=models[key];if(!M)return res.status(404).json({success:false,message:'Resource not found'});const errors=validate(key,req.body);if(Object.keys(errors).length)return res.status(400).json({success:false,message:'Validation failed',errors});const b={...req.body};if(key==='customers'){b.email=cleanEmail(b.email);b.owner=ownerFor(key,req.user,b);b.createdBy=req.user._id;b.customerCode='CUS-'+Date.now().toString(36).toUpperCase()}else if(key==='leads'){b.email=b.email?cleanEmail(b.email):undefined;b.assignedTo=ownerFor(key,req.user,b);b.leadCode='LED-'+Date.now().toString(36).toUpperCase()}else if(key==='opportunities'){b.assignedTo=ownerFor(key,req.user,b);b.status=b.stage==='Won'?'Won':b.stage==='Lost'?'Lost':'Open'}else if(key==='followups'){b.assignedTo=ownerFor(key,req.user,b)}else if(key==='activities'){b.assignedTo=ownerFor(key,req.user,b)}const doc=await M.create(b);await audit({req,userId:req.user._id,action:'CREATE',entityName:auditNames[key],recordId:doc._id.toString(),newValue:doc.toObject()});res.status(201).json({success:true,message:`${auditNames[key]} created successfully`,data:doc})}
-export async function update(req,res){const key=req.params.resource,M=models[key];const current=await M.findOne(baseQuery(req.user,key,{_id:req.params.id}));if(!current)return res.status(404).json({success:false,message:'Record not found'});const errors=validate(key,{...current.toObject(),...req.body},false);if(Object.keys(errors).length)return res.status(400).json({success:false,message:'Validation failed',errors});const b={...req.body};if(key==='customers'&&b.email)b.email=cleanEmail(b.email);if(key==='leads'&&b.email)b.email=cleanEmail(b.email);if(key==='opportunities'&&b.stage)b.status=b.stage==='Won'?'Won':b.stage==='Lost'?'Lost':'Open';if(req.user.role==='SALES_EXECUTIVE'){delete b.owner;delete b.assignedTo}Object.assign(current,b);const old=current.toObject();const doc=await current.save();await audit({req,userId:req.user._id,action:'UPDATE',entityName:auditNames[key],recordId:doc._id.toString(),oldValue:old,newValue:doc.toObject()});res.json({success:true,message:`${auditNames[key]} updated successfully`,data:doc})}
-export async function remove(req,res){const key=req.params.resource,M=models[key];const current=await M.findOne(baseQuery(req.user,key,{_id:req.params.id}));if(!current)return res.status(404).json({success:false,message:'Record not found'});if(key==='customers')current.status='Inactive';else if(key==='leads')current.status='Lost';else if(key==='opportunities'){current.status='Lost';current.stage='Lost'}else if(key==='followups')current.status='Cancelled';else if(key==='activities')current.status='Cancelled';await current.save();await audit({req,userId:req.user._id,action:'DELETE',entityName:auditNames[key],recordId:current._id.toString(),oldValue:current.toObject(),details:'Soft delete/deactivation'});res.json({success:true,message:'Record deactivated successfully'})}
-export async function convertLead(req,res){const lead=await Lead.findOne({...scope(req.user,'leads'),_id:req.params.id});if(!lead)return res.status(404).json({success:false,message:'Lead not found'});if(lead.status!=='Qualified')return res.status(400).json({success:false,message:'Only Qualified leads can be converted'});const existing=lead.email?await Customer.findOne({email:lead.email}):null;const customer=existing||await Customer.create({customerCode:'CUS-'+Date.now().toString(36).toUpperCase(),customerName:lead.leadName,email:lead.email||`lead-${lead._id}@example.invalid`,phone:lead.phone||'6000000000',companyName:lead.companyName,status:'Prospect',owner:lead.assignedTo,createdBy:req.user._id});let opportunity=null;if(req.body.createOpportunity!==false){opportunity=await Opportunity.create({opportunityName:`${lead.leadName} Opportunity`,customer:customer._id,lead:lead._id,amount:Number(lead.expectedValue)||1,stage:'Qualification',probability:20,expectedCloseDate:new Date(Date.now()+30*86400000),status:'Open',assignedTo:lead.assignedTo})}lead.status='Converted';lead.convertedCustomer=customer._id;if(opportunity)lead.convertedOpportunity=opportunity._id;await lead.save();await audit({req,userId:req.user._id,action:'CONVERSION',entityName:'Lead',recordId:lead._id.toString(),newValue:{customer:customer._id,opportunity:opportunity?._id}});res.json({success:true,message:'Lead converted successfully',data:{lead,customer,opportunity}})}
+const allowedFields={
+  customers:['customerName','email','phone','companyName','address','city','state','status','owner'],
+  leads:['leadName','email','phone','companyName','source','status','priority','expectedValue','assignedTo'],
+  opportunities:['opportunityName','customer','lead','amount','stage','probability','expectedCloseDate','status','assignedTo','notes'],
+  followups:['customer','lead','opportunity','followUpDate','followUpType','subject','remarks','status','assignedTo'],
+  activities:['customer','lead','opportunity','activityType','subject','description','activityDate','assignedTo','status']
+};
+const relatedModels={
+  opportunities:{customer:[Customer,'owner'],lead:[Lead,'assignedTo']},
+  followups:{customer:[Customer,'owner'],lead:[Lead,'assignedTo'],opportunity:[Opportunity,'assignedTo']},
+  activities:{customer:[Customer,'owner'],lead:[Lead,'assignedTo'],opportunity:[Opportunity,'assignedTo']}
+};
+
+async function baseQuery(user,key,query={}){
+  return {...query,...await assignedScope(user,ownerField[key])};
+}
+
+function pageParams(req){
+  return {page:Math.max(1,Number(req.query.page)||1),limit:Math.min(100,Math.max(1,Number(req.query.limit)||10))};
+}
+
+function buildFilter(key,q){
+  const filter={};
+  if(q.search){
+    const expression=q.search.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
+    const regex={$regex:expression,$options:'i'};
+    const fields={
+      customers:['customerName','email','phone','companyName'],
+      leads:['leadName','companyName','status'],
+      opportunities:['opportunityName','stage','status'],
+      followups:['subject','status','followUpType'],
+      activities:['subject','status','activityType']
+    }[key];
+    filter.$or=fields.map(field=>({[field]:regex}));
+  }
+  for(const field of ['status','stage','priority','assignedTo','owner','followUpType','activityType','customer','lead','opportunity']){
+    if(q[field])filter[field]=q[field];
+  }
+  if(q.from||q.to){
+    const field=key==='followups'?'followUpDate':key==='activities'?'activityDate':'createdAt';
+    filter[field]={};
+    if(q.from)filter[field].$gte=new Date(q.from);
+    if(q.to){const end=new Date(q.to);end.setHours(23,59,59,999);filter[field].$lte=end}
+  }
+  return filter;
+}
+
+function validate(key,body){
+  const errors={};
+  const validDate=value=>value&&Number.isFinite(new Date(value).getTime());
+  if(key==='customers'){
+    if(typeof body.customerName!=='string'||!body.customerName.trim())errors.customerName='Customer Name is required';
+    if(!body.email||!emailRe.test(cleanEmail(body.email)))errors.email='Enter a valid email address';
+    if(!body.phone||!phoneRe.test(String(body.phone).replace(/\s/g,'')))errors.phone='Enter a valid 10-digit Indian phone number';
+  }
+  if(key==='leads'){
+    if(typeof body.leadName!=='string'||!body.leadName.trim())errors.leadName='Lead name is required';
+    if(body.status==='Converted')errors.status='Use the lead conversion action to convert a lead';
+    if(body.email&&!emailRe.test(cleanEmail(body.email)))errors.email='Enter a valid email address';
+    if(body.phone&&!phoneRe.test(String(body.phone).replace(/\s/g,'')))errors.phone='Enter a valid 10-digit Indian phone number';
+    if(body.expectedValue!=null&&(!Number.isFinite(Number(body.expectedValue))||Number(body.expectedValue)<0))errors.expectedValue='Expected value cannot be negative';
+  }
+  if(key==='opportunities'){
+    if(typeof body.opportunityName!=='string'||!body.opportunityName.trim())errors.opportunityName='Opportunity name is required';
+    if(body.amount==null||!Number.isFinite(Number(body.amount))||Number(body.amount)<=0)errors.amount='Opportunity Amount must be greater than 0';
+    if(body.probability==null||!Number.isFinite(Number(body.probability))||Number(body.probability)<0||Number(body.probability)>100)errors.probability='Probability must be between 0 and 100';
+    if(!validDate(body.expectedCloseDate))errors.expectedCloseDate='A valid Expected Close Date is required';
+    else if(new Date(body.expectedCloseDate)<todayStart()&&!['Won','Lost'].includes(body.status)&&!['Won','Lost'].includes(body.stage))errors.expectedCloseDate='Expected Close Date cannot be in the past for an active opportunity';
+  }
+  if(key==='followups'){
+    if(!validDate(body.followUpDate))errors.followUpDate='A valid follow-up date is required';
+    else if(new Date(body.followUpDate)<todayStart()&&(!body.status||body.status==='Planned'))errors.followUpDate='Follow-up date cannot be earlier than today';
+    if(body.followUpType&&!['Call','Meeting','Email','Task'].includes(body.followUpType))errors.followUpType='Invalid follow-up type';
+    if(body.status&&!['Planned','Completed','Missed','Cancelled'].includes(body.status))errors.status='Invalid follow-up status';
+  }
+  if(key==='activities'){
+    if(!body.activityType)errors.activityType='Activity type is required';
+    if(typeof body.subject!=='string'||!body.subject.trim())errors.subject='Subject is required';
+    if(!validDate(body.activityDate))errors.activityDate='A valid activity date is required';
+  }
+  return errors;
+}
+
+function assignedField(key){return key==='customers'?'owner':'assignedTo'}
+
+function pickedFields(key,body){
+  return Object.fromEntries(allowedFields[key].filter(field=>body[field]!==undefined).map(field=>[field,body[field]]));
+}
+
+async function validateReferences(key,body,user){
+  const errors={};
+  const field=assignedField(key);
+  const assignment=body[field];
+  if(assignment!=null&&assignment!==''){
+    if(!mongoose.isObjectIdOrHexString(assignment)){
+      errors[field]='Assigned user must be a valid user ID';
+    }else{
+      const assignee=await User.findById(assignment).select('_id role manager isActive');
+      if(!assignee||!assignee.isActive)errors[field]='Assigned user does not exist or is inactive';
+      else if(user.role==='SALES_EXECUTIVE'&&String(assignee._id)!==String(user._id))errors[field]='Sales Executives can only assign records to themselves';
+      else if(user.role==='MANAGER'&&String(assignee._id)!==String(user._id)&&String(assignee.manager)!==String(user._id))errors[field]='Managers can only assign records to themselves or their direct reports';
+    }
+  }
+  for(const [name,[Model,scopeField]] of Object.entries(relatedModels[key]||{})){
+    const id=body[name];
+    if(id==null||id==='')continue;
+    if(!mongoose.isObjectIdOrHexString(id)){errors[name]=`${name} must be a valid ID`;continue}
+    const query={_id:id,...await assignedScope(user,scopeField)};
+    if(!await Model.exists(query))errors[name]=`${name} does not exist or is outside your assigned scope`;
+  }
+  return errors;
+}
+
+export async function list(req,res){
+  const key=req.params.resource,M=models[key];
+  if(!M)return res.status(404).json({success:false,message:'Resource not found'});
+  const {page,limit}=pageParams(req);
+  const filter=await baseQuery(req.user,key,buildFilter(key,req.query));
+  const sortField=String(req.query.sort||'-createdAt');
+  if(!/^-?[a-zA-Z][a-zA-Z0-9]*$/.test(sortField))return res.status(400).json({success:false,message:'Invalid sort field'});
+  const total=await M.countDocuments(filter);
+  let query=M.find(filter).sort(sortField).skip((page-1)*limit).limit(limit);
+  if(populate[key])query=query.populate(populate[key]);
+  const data=await query.lean();
+  res.json({success:true,data,pagination:{page,limit,total,totalPages:Math.ceil(total/limit)}});
+}
+
+export async function getOne(req,res){
+  const key=req.params.resource,M=models[key];
+  if(!M)return res.status(404).json({success:false,message:'Resource not found'});
+  const doc=await M.findOne(await baseQuery(req.user,key,{_id:req.params.id})).populate(populate[key]||'');
+  if(!doc)return res.status(404).json({success:false,message:'Record not found'});
+  res.json({success:true,data:doc});
+}
+
+export async function create(req,res){
+  const key=req.params.resource,M=models[key];
+  if(!M)return res.status(404).json({success:false,message:'Resource not found'});
+  const body=pickedFields(key,req.body||{});
+  const field=assignedField(key);
+  if(req.user.role==='SALES_EXECUTIVE')body[field]=req.user._id;
+  else body[field]??=req.user._id;
+  if(key==='customers'){body.email=cleanEmail(body.email||'');body.phone=String(body.phone||'').replace(/\s/g,'');body.createdBy=req.user._id;body.customerCode='CUS-'+Date.now().toString(36).toUpperCase()}
+  if(key==='leads'){if(body.email)body.email=cleanEmail(body.email);if(body.phone)body.phone=String(body.phone).replace(/\s/g,'');body.leadCode='LED-'+Date.now().toString(36).toUpperCase()}
+  if(key==='opportunities')body.status=body.stage==='Won'?'Won':body.stage==='Lost'?'Lost':'Open';
+  const errors={...validate(key,body),...await validateReferences(key,body,req.user)};
+  if(Object.keys(errors).length)return res.status(400).json({success:false,message:'Validation failed',errors});
+  const doc=await M.create(body);
+  await audit({req,userId:req.user._id,action:'CREATE',entityName:auditNames[key],recordId:doc._id.toString(),newValue:doc.toObject()});
+  res.status(201).json({success:true,message:`${auditNames[key]} created successfully`,data:doc});
+}
+
+export async function update(req,res){
+  const key=req.params.resource,M=models[key];
+  if(!M)return res.status(404).json({success:false,message:'Resource not found'});
+  const current=await M.findOne(await baseQuery(req.user,key,{_id:req.params.id}));
+  if(!current)return res.status(404).json({success:false,message:'Record not found'});
+  if(key==='leads'&&current.status==='Converted')return res.status(400).json({success:false,message:'Converted leads cannot be edited'});
+  const body=pickedFields(key,req.body||{});
+  if(key==='leads'&&body.status==='Converted')return res.status(400).json({success:false,message:'Use the lead conversion action to convert a lead'});
+  if(req.user.role==='SALES_EXECUTIVE'){delete body.owner;delete body.assignedTo}
+  if(key==='customers'&&body.email)body.email=cleanEmail(body.email);
+  if(key==='customers'&&body.phone)body.phone=String(body.phone).replace(/\s/g,'');
+  if(key==='leads'&&body.email)body.email=cleanEmail(body.email);
+  if(key==='leads'&&body.phone)body.phone=String(body.phone).replace(/\s/g,'');
+  const merged={...current.toObject(),...body};
+  if(key==='opportunities'&&body.stage)merged.status=body.stage==='Won'?'Won':body.stage==='Lost'?'Lost':'Open';
+  const errors={...validate(key,merged),...await validateReferences(key,merged,req.user)};
+  if(Object.keys(errors).length)return res.status(400).json({success:false,message:'Validation failed',errors});
+  const oldValue=current.toObject();
+  Object.assign(current,body);
+  if(key==='opportunities'&&body.stage)current.status=body.stage==='Won'?'Won':body.stage==='Lost'?'Lost':'Open';
+  const doc=await current.save();
+  await audit({req,userId:req.user._id,action:'UPDATE',entityName:auditNames[key],recordId:doc._id.toString(),oldValue,newValue:doc.toObject()});
+  res.json({success:true,message:`${auditNames[key]} updated successfully`,data:doc});
+}
+
+export async function remove(req,res){
+  const key=req.params.resource,M=models[key];
+  if(!M)return res.status(404).json({success:false,message:'Resource not found'});
+  const current=await M.findOne(await baseQuery(req.user,key,{_id:req.params.id}));
+  if(!current)return res.status(404).json({success:false,message:'Record not found'});
+  const oldValue=current.toObject();
+  if(key==='customers')current.status='Inactive';
+  else if(key==='leads')current.status='Lost';
+  else if(key==='opportunities'){current.status='Lost';current.stage='Lost'}
+  else current.status='Cancelled';
+  await current.save();
+  await audit({req,userId:req.user._id,action:'DELETE',entityName:auditNames[key],recordId:current._id.toString(),oldValue,newValue:current.toObject(),details:'Soft delete/deactivation'});
+  res.json({success:true,message:'Record deactivated successfully'});
+}
+
+export async function convertLead(req,res){
+  const lead=await Lead.findOne({...await assignedScope(req.user,'assignedTo'),_id:req.params.id});
+  if(!lead)return res.status(404).json({success:false,message:'Lead not found'});
+  if(lead.status==='Converted')return res.status(409).json({success:false,message:'Lead has already been converted'});
+  if(lead.status!=='Qualified')return res.status(400).json({success:false,message:'Only Qualified leads can be converted'});
+  const errors={};
+  if(!lead.leadName?.trim())errors.leadName='Lead name is required before conversion';
+  if(!lead.email||!emailRe.test(cleanEmail(lead.email)))errors.email='A valid lead email is required before conversion';
+  if(!lead.phone||!phoneRe.test(String(lead.phone).replace(/\s/g,'')))errors.phone='A valid 10-digit lead phone is required before conversion';
+  if(!Number.isFinite(Number(lead.expectedValue))||Number(lead.expectedValue)<=0)errors.expectedValue='A positive expected value is required to create the opportunity';
+  if(Object.keys(errors).length)return res.status(400).json({success:false,message:'Lead cannot be converted',errors});
+  const assignedTo=await User.findById(lead.assignedTo).select('_id isActive');
+  if(!assignedTo?.isActive)return res.status(400).json({success:false,message:'Lead assignee does not exist or is inactive'});
+  const duplicate=await Customer.findOne({$or:[{email:cleanEmail(lead.email)},{phone:String(lead.phone).replace(/\s/g,'')}]});
+  if(duplicate)return res.status(409).json({success:false,message:'A customer with this email or phone already exists'});
+  const oldLead=lead.toObject();
+  const reservedLead=await Lead.findOneAndUpdate(
+    {_id:lead._id,status:'Qualified'},
+    {$set:{status:'Converted'}},
+    {new:true}
+  );
+  if(!reservedLead)return res.status(409).json({success:false,message:'Lead has already been converted'});
+  let customer;
+  let opportunity;
+  try{
+    customer=await Customer.create({
+      customerCode:'CUS-'+Date.now().toString(36).toUpperCase(),
+      customerName:lead.leadName,email:cleanEmail(lead.email),phone:String(lead.phone).replace(/\s/g,''),
+      companyName:lead.companyName,status:'Prospect',owner:lead.assignedTo,createdBy:req.user._id
+    });
+    opportunity=await Opportunity.create({
+      opportunityName:`${lead.leadName} Opportunity`,customer:customer._id,lead:lead._id,
+      amount:Number(lead.expectedValue),stage:'Qualification',probability:20,
+      expectedCloseDate:new Date(Date.now()+30*86400000),status:'Open',assignedTo:lead.assignedTo
+    });
+    lead.status='Converted';
+    lead.convertedCustomer=customer._id;
+    lead.convertedOpportunity=opportunity._id;
+    await lead.save();
+  }catch(error){
+    if(opportunity)await Opportunity.deleteOne({_id:opportunity._id});
+    if(customer)await Customer.deleteOne({_id:customer._id});
+    await Lead.updateOne({_id:lead._id,status:'Converted',convertedCustomer:{$exists:false}},{$set:{status:'Qualified'}});
+    throw error;
+  }
+  await audit({req,userId:req.user._id,action:'CREATE',entityName:'Customer',recordId:customer._id.toString(),newValue:customer.toObject(),details:'Created during lead conversion'});
+  await audit({req,userId:req.user._id,action:'CREATE',entityName:'Opportunity',recordId:opportunity._id.toString(),newValue:opportunity.toObject(),details:'Created during lead conversion'});
+  await audit({req,userId:req.user._id,action:'CONVERSION',entityName:'Lead',recordId:lead._id.toString(),oldValue:oldLead,newValue:lead.toObject(),details:'Lead converted to customer and opportunity'});
+  res.json({success:true,message:'Lead converted successfully',data:{lead,customer,opportunity}});
+}

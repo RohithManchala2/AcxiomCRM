@@ -19,3 +19,4 @@ npm run dev
 ```
 Frontend: http://localhost:5173
 
+For Manager team-scoped records and reports, assign Sales Executive accounts to a Manager in the admin User Management page.
