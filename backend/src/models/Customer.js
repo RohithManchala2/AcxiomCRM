@@ -1,0 +1,4 @@
+import mongoose from 'mongoose';
+const schema=new mongoose.Schema({customerCode:{type:String,unique:true},customerName:{type:String,required:true,trim:true,maxLength:120},email:{type:String,required:true,lowercase:true,trim:true},phone:{type:String,required:true,trim:true},companyName:{type:String,trim:true,maxLength:150},address:{type:String,trim:true,maxLength:300},city:{type:String,trim:true,maxLength:80},state:{type:String,trim:true,maxLength:80},status:{type:String,enum:['Active','Inactive','Prospect'],default:'Active'},owner:{type:mongoose.Schema.Types.ObjectId,ref:'User',required:true},createdBy:{type:mongoose.Schema.Types.ObjectId,ref:'User',required:true}},{timestamps:true});
+schema.index({email:1},{unique:true}); schema.index({phone:1},{unique:true}); schema.index({customerName:1});
+export default mongoose.model('Customer',schema);

@@ -1,0 +1,9 @@
+export const ROLES={ADMIN:'ADMIN',MANAGER:'MANAGER',SALES_EXECUTIVE:'SALES_EXECUTIVE'};
+export const LEAD_STATUSES=['New','Contacted','Qualified','Unqualified','Converted','Lost'];
+export const OPPORTUNITY_STAGES=['Qualification','Proposal','Negotiation','Won','Lost'];
+export const FOLLOWUP_STATUSES=['Planned','Completed','Missed','Cancelled'];
+export const ACTIVITY_TYPES=['Call','Meeting','Email','Task'];
+export const ACTIVITY_STATUSES=['Planned','Completed','Cancelled'];
+export const CUSTOMER_STATUSES=['Active','Inactive','Prospect'];
+export const PRIORITIES=['Low','Medium','High'];
+export const FOLLOWUP_TYPES=ACTIVITY_TYPES;

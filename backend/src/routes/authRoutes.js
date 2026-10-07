@@ -1,0 +1,1 @@
+import {Router} from 'express';import {login,logout,me,register} from '../controllers/authController.js';import {auth} from '../middleware/auth.js';import {authLimiter} from '../middleware/security.js';const r=Router();r.post('/register',register);r.post('/login',authLimiter,login);r.post('/logout',auth,logout);r.get('/me',auth,me);export default r;

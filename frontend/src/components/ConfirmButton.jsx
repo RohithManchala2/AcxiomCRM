@@ -1,0 +1,1 @@
+export default function ConfirmButton({onConfirm,children='Delete',className='btn btn-outline-danger btn-sm'}){return <button className={className} onClick={()=>window.confirm('Are you sure?')&&onConfirm()}>{children}</button>}
