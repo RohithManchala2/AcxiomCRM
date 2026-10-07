@@ -7,9 +7,20 @@ Prerequisites: Node.js 20+, MongoDB 6+.
 ```bash
 cd backend
 npm install
+```
+Create a private local environment file (PowerShell):
+```powershell
+Copy-Item .env.example .env
+```
+Before starting, set `MONGO_URI` and replace `JWT_SECRET` in `backend/.env`. Generate a secret locally with:
+```powershell
+node -e "console.log(require('node:crypto').randomBytes(32).toString('hex'))"
+```
+Keep the generated value private and do not commit `backend/.env`. Backend: http://localhost:5000
+Start the backend from the `backend` directory:
+```bash
 npm run dev
 ```
-Backend: http://localhost:5000
 
 ### Frontend
 ```bash

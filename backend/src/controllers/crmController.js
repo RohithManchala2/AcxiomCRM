@@ -4,10 +4,12 @@ import Lead from '../models/Lead.js';
 import Opportunity from '../models/Opportunity.js';
 import FollowUp from '../models/FollowUp.js';
 import Activity from '../models/Activity.js';
+import AuditLog from '../models/AuditLog.js';
 import User from '../models/User.js';
 import {audit} from '../services/auditService.js';
 import {assignedScope} from '../utils/scope.js';
 import {emailRe,phoneRe,todayStart,cleanEmail} from '../utils/validation.js';
+import {parseDateRange,parsePagination,scopedFilter} from '../utils/query.js';
 
 const models={customers:Customer,leads:Lead,opportunities:Opportunity,followups:FollowUp,activities:Activity};
 const ownerField={customers:'owner',leads:'assignedTo',opportunities:'assignedTo',followups:'assignedTo',activities:'assignedTo'};
@@ -26,14 +28,6 @@ const relatedModels={
   activities:{customer:[Customer,'owner'],lead:[Lead,'assignedTo'],opportunity:[Opportunity,'assignedTo']}
 };
 
-async function baseQuery(user,key,query={}){
-  return {...query,...await assignedScope(user,ownerField[key])};
-}
-
-function pageParams(req){
-  return {page:Math.max(1,Number(req.query.page)||1),limit:Math.min(100,Math.max(1,Number(req.query.limit)||10))};
-}
-
 function buildFilter(key,q){
   const filter={};
   if(q.search){
@@ -49,13 +43,17 @@ function buildFilter(key,q){
     filter.$or=fields.map(field=>({[field]:regex}));
   }
   for(const field of ['status','stage','priority','assignedTo','owner','followUpType','activityType','customer','lead','opportunity']){
-    if(q[field])filter[field]=q[field];
-  }
-  if(q.from||q.to){
-    const field=key==='followups'?'followUpDate':key==='activities'?'activityDate':'createdAt';
-    filter[field]={};
-    if(q.from)filter[field].$gte=new Date(q.from);
-    if(q.to){const end=new Date(q.to);end.setHours(23,59,59,999);filter[field].$lte=end}
+    if(q[field]){
+      if(key==='followups'&&field==='status'&&q.status==='Overdue'){
+        filter.status='Planned';
+        filter.followUpDate={$lt:todayStart()};
+        continue;
+      }
+      if(['assignedTo','owner','customer','lead','opportunity'].includes(field)){
+        if(!mongoose.isObjectIdOrHexString(q[field]))filter.__invalidObjectId=field;
+        else filter[field]=q[field];
+      }else filter[field]=q[field];
+    }
   }
   return filter;
 }
@@ -81,6 +79,8 @@ function validate(key,body){
     if(body.probability==null||!Number.isFinite(Number(body.probability))||Number(body.probability)<0||Number(body.probability)>100)errors.probability='Probability must be between 0 and 100';
     if(!validDate(body.expectedCloseDate))errors.expectedCloseDate='A valid Expected Close Date is required';
     else if(new Date(body.expectedCloseDate)<todayStart()&&!['Won','Lost'].includes(body.status)&&!['Won','Lost'].includes(body.stage))errors.expectedCloseDate='Expected Close Date cannot be in the past for an active opportunity';
+    const expectedStatus=body.stage==='Won'?'Won':body.stage==='Lost'?'Lost':'Open';
+    if(body.status&&body.status!==expectedStatus)errors.status='Opportunity status must match its stage';
   }
   if(key==='followups'){
     if(!validDate(body.followUpDate))errors.followUpDate='A valid follow-up date is required';
@@ -129,12 +129,19 @@ async function validateReferences(key,body,user){
 export async function list(req,res){
   const key=req.params.resource,M=models[key];
   if(!M)return res.status(404).json({success:false,message:'Resource not found'});
-  const {page,limit}=pageParams(req);
-  const filter=await baseQuery(req.user,key,buildFilter(key,req.query));
+  const {page,limit,errors:pageErrors}=parsePagination(req.query,10);
+  if(Object.keys(pageErrors).length)return res.status(400).json({success:false,message:'Invalid pagination',errors:pageErrors});
+  const filter=buildFilter(key,req.query);
+  if(filter.__invalidObjectId){const field=filter.__invalidObjectId;delete filter.__invalidObjectId;return res.status(400).json({success:false,message:`${field} must be a valid ID`})}
+  const dateField=key==='followups'?'followUpDate':key==='activities'?'activityDate':'createdAt';
+  const {filter:dateFilter,errors:dateErrors}=parseDateRange(req.query,dateField);
+  if(Object.keys(dateErrors).length)return res.status(400).json({success:false,message:'Invalid date range',errors:dateErrors});
+  const scope=await assignedScope(req.user,ownerField[key]);
+  const criteria=scopedFilter(scope,scopedFilter(filter,dateFilter));
   const sortField=String(req.query.sort||'-createdAt');
   if(!/^-?[a-zA-Z][a-zA-Z0-9]*$/.test(sortField))return res.status(400).json({success:false,message:'Invalid sort field'});
-  const total=await M.countDocuments(filter);
-  let query=M.find(filter).sort(sortField).skip((page-1)*limit).limit(limit);
+  const total=await M.countDocuments(criteria);
+  let query=M.find(criteria).sort(sortField).skip((page-1)*limit).limit(limit);
   if(populate[key])query=query.populate(populate[key]);
   const data=await query.lean();
   res.json({success:true,data,pagination:{page,limit,total,totalPages:Math.ceil(total/limit)}});
@@ -143,7 +150,8 @@ export async function list(req,res){
 export async function getOne(req,res){
   const key=req.params.resource,M=models[key];
   if(!M)return res.status(404).json({success:false,message:'Resource not found'});
-  const doc=await M.findOne(await baseQuery(req.user,key,{_id:req.params.id})).populate(populate[key]||'');
+  if(!mongoose.isObjectIdOrHexString(req.params.id))return res.status(400).json({success:false,message:'Invalid record ID'});
+  const doc=await M.findOne(scopedFilter(await assignedScope(req.user,ownerField[key]),{_id:req.params.id})).populate(populate[key]||'');
   if(!doc)return res.status(404).json({success:false,message:'Record not found'});
   res.json({success:true,data:doc});
 }
@@ -168,7 +176,8 @@ export async function create(req,res){
 export async function update(req,res){
   const key=req.params.resource,M=models[key];
   if(!M)return res.status(404).json({success:false,message:'Resource not found'});
-  const current=await M.findOne(await baseQuery(req.user,key,{_id:req.params.id}));
+  if(!mongoose.isObjectIdOrHexString(req.params.id))return res.status(400).json({success:false,message:'Invalid record ID'});
+  const current=await M.findOne(scopedFilter(await assignedScope(req.user,ownerField[key]),{_id:req.params.id}));
   if(!current)return res.status(404).json({success:false,message:'Record not found'});
   if(key==='leads'&&current.status==='Converted')return res.status(400).json({success:false,message:'Converted leads cannot be edited'});
   const body=pickedFields(key,req.body||{});
@@ -179,12 +188,18 @@ export async function update(req,res){
   if(key==='leads'&&body.email)body.email=cleanEmail(body.email);
   if(key==='leads'&&body.phone)body.phone=String(body.phone).replace(/\s/g,'');
   const merged={...current.toObject(),...body};
-  if(key==='opportunities'&&body.stage)merged.status=body.stage==='Won'?'Won':body.stage==='Lost'?'Lost':'Open';
+  if(key==='opportunities'){
+    if(body.stage)merged.status=body.stage==='Won'?'Won':body.stage==='Lost'?'Lost':'Open';
+    else if(body.status)merged.stage=body.status==='Won'?'Won':body.status==='Lost'?'Lost':(['Won','Lost'].includes(current.stage)?'Qualification':current.stage);
+  }
   const errors={...validate(key,merged),...await validateReferences(key,merged,req.user)};
   if(Object.keys(errors).length)return res.status(400).json({success:false,message:'Validation failed',errors});
   const oldValue=current.toObject();
   Object.assign(current,body);
-  if(key==='opportunities'&&body.stage)current.status=body.stage==='Won'?'Won':body.stage==='Lost'?'Lost':'Open';
+  if(key==='opportunities'){
+    if(body.stage)current.status=body.stage==='Won'?'Won':body.stage==='Lost'?'Lost':'Open';
+    else if(body.status)current.stage=body.status==='Won'?'Won':body.status==='Lost'?'Lost':(['Won','Lost'].includes(current.stage)?'Qualification':current.stage);
+  }
   const doc=await current.save();
   await audit({req,userId:req.user._id,action:'UPDATE',entityName:auditNames[key],recordId:doc._id.toString(),oldValue,newValue:doc.toObject()});
   res.json({success:true,message:`${auditNames[key]} updated successfully`,data:doc});
@@ -193,8 +208,10 @@ export async function update(req,res){
 export async function remove(req,res){
   const key=req.params.resource,M=models[key];
   if(!M)return res.status(404).json({success:false,message:'Resource not found'});
-  const current=await M.findOne(await baseQuery(req.user,key,{_id:req.params.id}));
+  if(!mongoose.isObjectIdOrHexString(req.params.id))return res.status(400).json({success:false,message:'Invalid record ID'});
+  const current=await M.findOne(scopedFilter(await assignedScope(req.user,ownerField[key]),{_id:req.params.id}));
   if(!current)return res.status(404).json({success:false,message:'Record not found'});
+  if(key==='leads'&&current.status==='Converted')return res.status(409).json({success:false,message:'Converted leads cannot be deactivated'});
   const oldValue=current.toObject();
   if(key==='customers')current.status='Inactive';
   else if(key==='leads')current.status='Lost';
@@ -206,6 +223,7 @@ export async function remove(req,res){
 }
 
 export async function convertLead(req,res){
+  if(!mongoose.isObjectIdOrHexString(req.params.id))return res.status(400).json({success:false,message:'Invalid lead ID'});
   const lead=await Lead.findOne({...await assignedScope(req.user,'assignedTo'),_id:req.params.id});
   if(!lead)return res.status(404).json({success:false,message:'Lead not found'});
   if(lead.status==='Converted')return res.status(409).json({success:false,message:'Lead has already been converted'});
@@ -244,14 +262,26 @@ export async function convertLead(req,res){
     lead.convertedCustomer=customer._id;
     lead.convertedOpportunity=opportunity._id;
     await lead.save();
+    await audit({req,userId:req.user._id,action:'CREATE',entityName:'Customer',recordId:customer._id.toString(),newValue:customer.toObject(),details:'Created during lead conversion'});
+    await audit({req,userId:req.user._id,action:'CREATE',entityName:'Opportunity',recordId:opportunity._id.toString(),newValue:opportunity.toObject(),details:'Created during lead conversion'});
+    await audit({req,userId:req.user._id,action:'CONVERSION',entityName:'Lead',recordId:lead._id.toString(),oldValue:oldLead,newValue:lead.toObject(),details:'Lead converted to customer and opportunity'});
   }catch(error){
-    if(opportunity)await Opportunity.deleteOne({_id:opportunity._id});
-    if(customer)await Customer.deleteOne({_id:customer._id});
-    await Lead.updateOne({_id:lead._id,status:'Converted',convertedCustomer:{$exists:false}},{$set:{status:'Qualified'}});
+    const rollback=[
+      Lead.updateOne({_id:lead._id,status:'Converted'},{$set:{status:oldLead.status},$unset:{convertedCustomer:1,convertedOpportunity:1}})
+    ];
+    if(customer){
+      rollback.push(Customer.deleteOne({_id:customer._id}));
+      rollback.push(AuditLog.deleteMany({recordId:customer._id.toString(),details:'Created during lead conversion'}));
+    }
+    if(opportunity){
+      rollback.push(Opportunity.deleteOne({_id:opportunity._id}));
+      rollback.push(AuditLog.deleteMany({recordId:opportunity._id.toString(),details:'Created during lead conversion'}));
+    }
+    rollback.push(AuditLog.deleteMany({recordId:lead._id.toString(),details:'Lead converted to customer and opportunity'}));
+    const cleanupResults=await Promise.allSettled(rollback);
+    const cleanupErrors=cleanupResults.filter(result=>result.status==='rejected').map(result=>({name:result.reason?.name,code:result.reason?.code}));
+    if(cleanupErrors.length)console.error('Lead conversion rollback incomplete',{leadId:lead._id.toString(),cleanupErrors});
     throw error;
   }
-  await audit({req,userId:req.user._id,action:'CREATE',entityName:'Customer',recordId:customer._id.toString(),newValue:customer.toObject(),details:'Created during lead conversion'});
-  await audit({req,userId:req.user._id,action:'CREATE',entityName:'Opportunity',recordId:opportunity._id.toString(),newValue:opportunity.toObject(),details:'Created during lead conversion'});
-  await audit({req,userId:req.user._id,action:'CONVERSION',entityName:'Lead',recordId:lead._id.toString(),oldValue:oldLead,newValue:lead.toObject(),details:'Lead converted to customer and opportunity'});
   res.json({success:true,message:'Lead converted successfully',data:{lead,customer,opportunity}});
 }

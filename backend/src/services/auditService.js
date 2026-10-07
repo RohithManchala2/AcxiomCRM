@@ -1,2 +1,16 @@
 import AuditLog from '../models/AuditLog.js';
-export async function audit({req,userId,action,entityName,recordId,oldValue,newValue,result='SUCCESS',details=''}){try{await AuditLog.create({user:userId,action,entityName,recordId,oldValue:oldValue?JSON.stringify(oldValue):undefined,newValue:newValue?JSON.stringify(newValue):undefined,result,details,ipAddress:req?.ip});}catch(e){console.error('Audit logging failed',e.message)}}
+
+export async function audit({req,userId,action,entityName,recordId,oldValue,newValue,result='SUCCESS',details=''}){
+  const serialize=value=>value===undefined?undefined:JSON.stringify(value);
+  return AuditLog.create({
+    user:userId,
+    action,
+    entityName,
+    recordId,
+    oldValue:serialize(oldValue),
+    newValue:serialize(newValue),
+    result,
+    details,
+    ipAddress:req?.ip
+  });
+}
